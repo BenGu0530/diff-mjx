@@ -17,6 +17,7 @@
 from jax import numpy as jp
 from mujoco.mjx._src import derivative
 from mujoco.mjx._src import forward
+from mujoco.mjx._src import math
 from mujoco.mjx._src import sensor
 from mujoco.mjx._src import smooth
 from mujoco.mjx._src import solver
@@ -82,10 +83,10 @@ def inv_constraint(m: Model, d: Data) -> Data:
   })
 
 
-def inverse(m: Model, d: Data) -> Data:
+def _inverse(m: Model, d: Data, soft: bool) -> Data:
   """Inverse dynamics."""
 
-  d = forward.fwd_position(m, d, soft=m.opt.pw_solimp is not None)
+  d = forward.fwd_position(m, d, soft=soft)
   d = sensor.sensor_pos(m, d)
   d = forward.fwd_velocity(m, d)
   d = sensor.sensor_vel(m, d)
@@ -110,3 +111,13 @@ def inverse(m: Model, d: Data) -> Data:
     return d.replace(qfrc_inverse=qfrc_inverse, qacc=qacc)
   else:
     return d.replace(qfrc_inverse=qfrc_inverse)
+
+
+def inverse(m: Model, d: Data) -> Data:
+  """Inverse dynamics with the same piecewise ST policy as forward dynamics."""
+  pw_enabled = m.opt.pw_solimp is not None
+  if pw_enabled and m.opt.st_enable:
+    d_soft = _inverse(m, d, soft=True)
+    d_hard = _inverse(m, d, soft=False)
+    return math.straight_through(d_hard, d_soft)
+  return _inverse(m, d, soft=pw_enabled)

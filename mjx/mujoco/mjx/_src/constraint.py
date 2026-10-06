@@ -767,14 +767,17 @@ def make_constraint(m: Model, d: Data, soft: bool = False) -> Data:
   efc = jax.tree_util.tree_map(lambda *x: jp.concatenate(x), *efcs)
 
   @jax.vmap
-  def fn(efc):
+  def fn(efc, is_contact):
     k, b, imp = _kbi(m, efc.solref, efc.solimp, efc._dmax, efc.pos_imp)
     r = jp.maximum(efc.invweight * (1 - imp) / imp, mujoco.mjMINVAL)
-    pos_aref = -jax.nn.relu(-efc.pos_aref) if soft else efc.pos_aref
+    pos_aref = efc.pos_aref
+    if soft:
+      pos_aref = jp.where(is_contact, -jax.nn.relu(-pos_aref), pos_aref)
     aref = -b * (efc.J @ d.qvel) - k * imp * pos_aref
     return aref, r, efc.pos_aref + efc.margin, efc.margin, efc.frictionloss
 
-  aref, r, pos, margin, frictionloss = fn(efc)
+  is_contact = d._impl.efc_type >= ConstraintType.CONTACT_FRICTIONLESS
+  aref, r, pos, margin, frictionloss = fn(efc, is_contact)
   d = d.tree_replace({
       '_impl.efc_J': efc.J,
       '_impl.efc_D': 1 / r,

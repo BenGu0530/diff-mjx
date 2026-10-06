@@ -1,3 +1,12 @@
+<h2>diff-mjx changes</h2>
+
+- **Per-operation ST wiring:** Propagates `opt.st_enable` through softened contact operations, preserving nominal hard forward values while using surrogate gradients.
+- **Closer nominal MJX behavior:** Corrects collision feature selection, tie-breaking, normalization, contact masks, duplicate contacts, and sign conventions.
+- **Updated softnesses:** Plane–cylinder degenerate-vector gate **1e-8**; capsule–capsule **4e-8**; box–box SAT **7e-5**, other operations **2e-5**.
+- **Soft validity gradients retained:** Removes forced gradient stops around box–box candidate validity, manifold masks, and contact counts.
+- **Numerical safeguards:** Adds finite-gradient protection for C2 clipping, coincident contacts, cylinder SDF derivatives, tendon wrapping, and muscle smoothing while retaining nominal forwards.
+- **Dynamics consistency:** Shares straight-through handling between forward and inverse piecewise-solimp calculations; limits contact-specific clamping to contact constraints.
+
 <h1>
   <a href="#"><img alt="MuJoCo" src="banner.png" width="100%"/></a>
 </h1>

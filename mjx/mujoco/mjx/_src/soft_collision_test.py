@@ -12,6 +12,7 @@ from mujoco.mjx._src import collision_convex
 from mujoco.mjx._src import collision_driver
 from mujoco.mjx._src import collision_types
 from mujoco.mjx._src import mesh
+from mujoco.mjx._src import math
 from mujoco.mjx._src import smooth
 import numpy as np
 
@@ -236,6 +237,65 @@ def _contact_set_error(x, y):
 
 class SoftCollisionTest(parameterized.TestCase):
 
+  @parameterized.product(case=_TEST_CASES, mode=('smooth', 'c2'))
+  def test_model_st_contact_forward_values(self, case, mode):
+    name, xml, _ = case
+    m = mujoco.MjModel.from_xml_string(xml)
+    d = mujoco.MjData(m)
+    mujoco.mj_forward(m, d)
+    mx, dx = mjx.put_model(m), mjx.put_data(m, d)
+
+    def contact(mode, st_enable):
+      model = mx.replace(opt=mx.opt.replace(
+          softjax_mode=mode, st_enable=st_enable, pw_solimp=None
+      ))
+      result = jax.jit(collision_driver.collision)(model, dx)._impl.contact
+      return result.dist, result.pos, result.frame
+
+    hard = contact('hard', False)
+    straight_through = contact(mode, True)
+    for actual, expected in zip(straight_through, hard):
+      np.testing.assert_allclose(actual, expected, atol=1e-5, rtol=1e-5,
+                                 err_msg=name)
+    soft = contact(mode, False)
+    for value in soft:
+      self.assertTrue(np.all(np.isfinite(np.asarray(value))), name)
+    # These fixtures lie inside a smoothing band.  Other fixtures can have
+    # identical hard and soft values, especially with compact C2 smoothing.
+    if mode == 'smooth' and name in (
+        'plane_box', 'plane_capsule', 'plane_cylinder_parallel',
+        'sphere_sphere', 'sphere_sphere_coincident', 'sphere_capsule', 'box_box'
+    ):
+      self.assertTrue(any(not np.allclose(a, b, atol=1e-5, rtol=1e-5)
+                          for a, b in zip(soft, straight_through)), name)
+
+    model = mx.replace(opt=mx.opt.replace(
+        softjax_mode=mode, st_enable=True, pw_solimp=None
+    ))
+    def contact_vector(qpos):
+      data = smooth.kinematics(model, dx.replace(qpos=qpos))
+      result = collision_driver.collision(model, data)._impl.contact
+      return jp.concatenate([x.reshape(-1) for x in (
+          result.dist, result.pos, result.frame
+      )])
+
+    tangent = jp.full_like(dx.qpos, 0.01)
+    derivative = jax.jit(lambda qpos: jax.jvp(
+        contact_vector, (qpos,), (tangent,)
+    )[1])(dx.qpos)
+    self.assertTrue(np.all(np.isfinite(np.asarray(derivative))), name)
+
+  @parameterized.parameters('smooth', 'c2')
+  def test_frame_st_preserves_surrogate_gradients(self, mode):
+    direction = jp.array([0.8, 0.49, 0.3])
+    def loss(a, selected_mode, st_enable):
+      return jp.sum(math.make_frame_soft(a, selected_mode,
+                                         st_enable=st_enable))
+    st_grad = jax.jit(jax.grad(lambda a: loss(a, mode, True)))(direction)
+    hard_grad = jax.grad(lambda a: loss(a, 'hard', False))(direction)
+    self.assertTrue(np.all(np.isfinite(np.asarray(st_grad))))
+    self.assertFalse(np.allclose(st_grad, hard_grad))
+
   def test_box_box_sat_axes(self):
     box_a, box_b = _box((0.0, 0.0, 0.0)), _box((0.3, 0.0, 0.0))
     axes, degenerate = collision_convex._box_box_axes_soft(
@@ -307,8 +367,10 @@ class SoftCollisionTest(parameterized.TestCase):
     box_a = _box((0.0, 0.0, 0.0))
     box_b = _box((0.31, 0.04, 0.03), mat=mat)
     hard = collision_convex._box_box(box_a, box_b)
-    loose = collision_convex._box_box_soft(box_a, box_b, mode, softness=1e-2)
-    tight = collision_convex._box_box_soft(box_a, box_b, mode, softness=1e-6)
+    loose = collision_convex._box_box_soft(
+        box_a, box_b, mode, softness=1e-2, sat_softness=1e-2)
+    tight = collision_convex._box_box_soft(
+        box_a, box_b, mode, softness=1e-6, sat_softness=1e-6)
 
     loose_error = np.linalg.norm(np.sort(loose[0]) - np.sort(hard[0]))
     tight_error = np.linalg.norm(np.sort(tight[0]) - np.sort(hard[0]))
@@ -343,12 +405,14 @@ class SoftCollisionTest(parameterized.TestCase):
         box_b,
         'smooth',
         softness=collision_convex._BOX_BOX_SOFTNESS,
+        sat_softness=collision_convex._BOX_BOX_SAT_SOFTNESS,
     )
     biased = collision_convex._box_box_soft(
-        box_a, box_b, 'smooth', softness=1e-3
+        box_a, box_b, 'smooth', softness=1e-3, sat_softness=1e-3
     )
 
-    self.assertEqual(collision_convex._BOX_BOX_SOFTNESS, 1e-4)
+    self.assertEqual(collision_convex._BOX_BOX_SOFTNESS, 2e-5)
+    self.assertEqual(collision_convex._BOX_BOX_SAT_SOFTNESS, 7e-5)
     jax.tree_util.tree_map(
         np.testing.assert_array_equal, tuned, explicit
     )
@@ -367,17 +431,17 @@ class SoftCollisionTest(parameterized.TestCase):
     def normal_y(offset, softness):
       moving = _box((0.31, offset, 0.03), mat=mat)
       return collision_convex._box_box_soft(
-          box_a, moving, 'smooth', softness=softness
+          box_a, moving, 'smooth', sat_softness=softness
       )[2][0, 1]
 
     hard_limit_grad = jax.grad(
         lambda offset: normal_y(offset, 1e-6)
-    )(jp.array(0.035))
+    )(jp.array(0.0352))
     tuned_grad = jax.grad(
         lambda offset: normal_y(
-            offset, collision_convex._BOX_BOX_SOFTNESS
+            offset, collision_convex._BOX_BOX_SAT_SOFTNESS
         )
-    )(jp.array(0.035))
+    )(jp.array(0.0352))
     self.assertLess(abs(float(hard_limit_grad)), 1e-5)
     self.assertGreater(abs(float(tuned_grad)), 1.0)
 

@@ -12,7 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Engine support functions."""
+"""Engine support functions.
+
+Safe square roots and inverse trig retain nominal caller guards and use finite
+boundary derivatives independently of softjax_mode and st_enable. Inverse trig
+saturates out-of-domain inputs; division retains nominal mjMINVAL protection.
+"""
 
 from collections.abc import Iterable, Sequence
 from typing import Optional, Tuple, Union
@@ -649,7 +654,8 @@ def _length_circle(
 
   # clip input to closed interval for jp.arccos to prevent potential nan
   # TODO(taylorhowell): add test for case where clip is necessary
-  angle = sj.arccos(jp.dot(p0n, p1n))
+  # Keep nominal clipping and use finite, zero derivatives at the endpoints.
+  angle = sj.arccos(jp.clip(jp.dot(p0n, p1n), -1, 1))
 
   # flip if necessary
   cross = p0[1] * p1[0] - p0[0] * p1[1]
@@ -667,11 +673,11 @@ def _is_intersect(
   det = (p4[1] - p3[1]) * (p2[0] - p1[0]) - (p4[0] - p3[0]) * (p2[1] - p1[1])
 
   # compute intersection point on each line
-  a = sj.div(
+  a = math.safe_div(
       (p4[0] - p3[0]) * (p1[1] - p3[1]) - (p4[1] - p3[1]) * (p1[0] - p3[0]),
       det,
   )
-  b = sj.div(
+  b = math.safe_div(
       (p2[0] - p1[0]) * (p1[1] - p3[1]) - (p2[1] - p1[1]) * (p1[0] - p3[0]),
       det,
   )
@@ -709,8 +715,9 @@ def wrap_circle(
 
   # construct the two solutions, compute goodness
   def _sol(sgn):
-    sqrt0 = sj.sqrt(sqlen0 - sqrad)
-    sqrt1 = sj.sqrt(sqlen1 - sqrad)
+    # The nominal floor also determines arc orientation at tangency.
+    sqrt0 = sj.sqrt(jp.maximum(mujoco.mjMINVAL, sqlen0 - sqrad))
+    sqrt1 = sj.sqrt(jp.maximum(mujoco.mjMINVAL, sqlen1 - sqrad))
 
     d00 = (d[0] * sqrad + sgn * rad * d[1] * sqrt0) / jp.maximum(
         mujoco.mjMINVAL, sqlen0
@@ -983,8 +990,8 @@ def wrap(
       (p1[0] - res[3]) * (p1[0] - res[3]) + (p1[1] - res[4]) * (p1[1] - res[4])
   )
   denom = l0 + wlen + l1
-  r2 = p0[2] + sj.div((p1[2] - p0[2]) * l0, denom)
-  r5 = p0[2] + sj.div((p1[2] - p0[2]) * (l0 + wlen), denom)
+  r2 = p0[2] + (p1[2] - p0[2]) * math.safe_div(l0, denom)
+  r5 = p0[2] + (p1[2] - p0[2]) * math.safe_div(l0 + wlen, denom)
   height = jp.abs(r5 - r2)
 
   wlen = jp.where(is_sphere, wlen, sj.sqrt(wlen * wlen + height * height))
@@ -1118,6 +1125,10 @@ def muscle_dynamics_timescale(
     # sigmoid function over 0 <= x <= 1 using quintic polynomial
     # sigmoid: f(x) = 6 * x^5 - 15 * x^4 + 10 * x^3
     # solution of f(0) = f'(0) = f''(0) = 0, f(1) = 1, f'(1) = f''(1) = 0
+    # Protected division can still produce large finite values. Evaluate the
+    # polynomial only in its nominal [0, 1] interval to avoid overflow in an
+    # inactive branch, including when smoothing_width is zero.
+    x = jp.clip(x, 0, 1)
     sol = x * x * x * (3 * x * (2 * x - 5) + 10)
     sol = jp.where(x <= 0, 0, sol)
     sol = jp.where(x >= 1, 1, sol)
@@ -1126,7 +1137,7 @@ def muscle_dynamics_timescale(
   # smooth switching
   # scale by width, center around 0.5 midpoint, rescale to bounds
   tau_smooth = tau_deact + (tau_act - tau_deact) * _sigmoid(
-      sj.div(dctrl, smoothing_width) + 0.5
+      math.safe_div(dctrl, smoothing_width) + 0.5
   )
 
   return jp.where(smoothing_width < mujoco.mjMINVAL, tau_hard, tau_smooth)

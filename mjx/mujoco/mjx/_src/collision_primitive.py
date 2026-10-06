@@ -18,7 +18,7 @@ from typing import Optional, Tuple
 
 import jax
 from jax import numpy as jp
-import softjax as sj
+from mujoco.mjx._src import softjax as sj
 from mujoco.mjx._src import math
 # pylint: disable=g-importing-member
 from mujoco.mjx._src.collision_types import Collision
@@ -33,13 +33,17 @@ def collider(ncon: int):
   """Wraps collision functions for use by collision_driver."""
 
   def wrapper(func):
+
     def collide(m: Model, d: Data, _, geom: jax.Array) -> Collision:
       g1, g2 = geom.T
       info1 = GeomInfo(d.geom_xpos[g1], d.geom_xmat[g1], m.geom_size[g1])
       info2 = GeomInfo(d.geom_xpos[g2], d.geom_xmat[g2], m.geom_size[g2])
       softjax_mode = m.opt.softjax_mode
       fn = functools.partial(
-          func, soft=softjax_mode is not None, softjax_mode=softjax_mode
+          func,
+          soft=softjax_mode is not None,
+          softjax_mode=softjax_mode,
+          st_enable=m.opt.st_enable,
       )
       dist, pos, frame = jax.vmap(fn)(info1, info2)
       if ncon > 1:
@@ -70,12 +74,14 @@ def plane_sphere(
     sphere: GeomInfo,
     soft: bool,
     softjax_mode: Optional[str],
+    *,
+    st_enable: bool = False,
 ) -> Collision:
   """Calculates contact between a plane and a sphere."""
   n = plane.mat[:, 2]
   dist, pos = _plane_sphere(n, plane.pos, sphere.pos, sphere.size[0])
   if soft:
-    return dist, pos, math.make_frame_soft(n, softjax_mode)
+    return dist, pos, math.make_frame_soft(n, softjax_mode, st_enable=st_enable)
   return dist, pos, math.make_frame(n)
 
 
@@ -85,6 +91,8 @@ def plane_capsule(
     cap: GeomInfo,
     soft: bool,
     softjax_mode: Optional[str],
+    *,
+    st_enable: bool = False,
 ) -> Collision:
   """Calculates two contacts between a capsule and a plane."""
   n, axis = plane.mat[:, 2], cap.mat[:, 2]
@@ -92,12 +100,24 @@ def plane_capsule(
   b, b_norm = math.normalize_with_norm(axis - n * jp.dot(n, axis))
   y, z = jp.array([0.0, 1.0, 0.0]), jp.array([0.0, 0.0, 1.0])
   if soft:
-    cond1 = sj.less(-0.5, n[1], softness=1.0, mode=softjax_mode)
-    cond2 = sj.less(n[1], 0.5, softness=1.0, mode=softjax_mode)
+    cond1 = sj.less(-0.5,
+                    n[1],
+                    softness=1.0,
+                    mode=softjax_mode,
+                    st_enable=st_enable)
+    cond2 = sj.less(n[1],
+                    0.5,
+                    softness=1.0,
+                    mode=softjax_mode,
+                    st_enable=st_enable)
     cond12 = sj.logical_and(cond1, cond2)
     yz = sj.where(cond12, y, z)
 
-    cond3 = sj.less(b_norm, 0.5, softness=1.0, mode=softjax_mode)
+    cond3 = sj.less(b_norm,
+                    0.5,
+                    softness=1.0,
+                    mode=softjax_mode,
+                    st_enable=st_enable)
     b = sj.where(cond3, yz, b)
   else:
     b = jp.where(b_norm < 0.5, jp.where((-0.5 < n[1]) & (n[1] < 0.5), y, z), b)
@@ -118,20 +138,23 @@ def plane_ellipsoid(
     ellipsoid: GeomInfo,
     soft: bool,
     softjax_mode: Optional[str],
+    *,
+    st_enable: bool = False,
 ) -> Collision:
   """Calculates one contact between an ellipsoid and a plane."""
   n = plane.mat[:, 2]
   size = ellipsoid.size
   if soft:
     v = (ellipsoid.mat.T @ n) * size
-    sphere_support = -math.normalize_with_norm_soft(v, mode=softjax_mode)[0]
+    sphere_support = -math.normalize_with_norm_soft(
+        v, mode=softjax_mode, st_enable=st_enable)[0]
   else:
     sphere_support = -math.normalize((ellipsoid.mat.T @ n) * size)
   pos = ellipsoid.pos + ellipsoid.mat @ (sphere_support * size)
   dist = jp.dot(n, pos - plane.pos)
   pos = pos - n * dist * 0.5
   if soft:
-    return dist, pos, math.make_frame_soft(n, softjax_mode)
+    return dist, pos, math.make_frame_soft(n, softjax_mode, st_enable=st_enable)
   return dist, pos, math.make_frame(n)
 
 
@@ -141,6 +164,8 @@ def plane_cylinder(
     cylinder: GeomInfo,
     soft: bool,
     softjax_mode: Optional[str],
+    *,
+    st_enable: bool = False,
 ) -> Collision:
   """Calculates three contacts between a cylinder and a plane."""
   n = plane.mat[:, 2]
@@ -149,7 +174,10 @@ def plane_cylinder(
   # make sure axis points towards plane
   prjaxis = jp.dot(n, axis)
   if soft:
-    sign = -sj.sign(prjaxis, softness=1e-3, mode=softjax_mode)
+    sign = -sj.sign(
+        prjaxis, softness=1e-3, mode=softjax_mode, st_enable=st_enable)
+    if st_enable or softjax_mode == 'hard':
+      sign = math.straight_through(-math.sign(prjaxis), sign)
   else:
     sign = -math.sign(prjaxis)
   axis, prjaxis = axis * sign, prjaxis * sign
@@ -161,10 +189,16 @@ def plane_cylinder(
   vec = axis * prjaxis - n
   if soft:
     len_ = sj.norm(vec)
+    if st_enable or softjax_mode == 'hard':
+      len_ = math.straight_through(math.norm(vec), len_)
   else:
     len_ = math.norm(vec)
   if soft:
-    cond = sj.less(len_, 1e-12, softness=1e-6, mode=softjax_mode)
+    cond = sj.less(len_,
+                   1e-12,
+                   softness=1e-8,
+                   mode=softjax_mode,
+                   st_enable=st_enable)
     # guard denominator so sj.where false branch does not produce NaN grads
     safe_len = len_ + 1e-6 * (len_ == 0.0)
     vec = sj.where(
@@ -195,7 +229,8 @@ def plane_cylinder(
   prjvec1 = -prjvec * 0.5
   if soft:
     cross = jp.cross(vec, axis)
-    vec1 = math.normalize_with_norm_soft(cross, mode=softjax_mode)[0] * cylinder.size[0]
+    vec1 = (math.normalize_with_norm_soft(
+        cross, mode=softjax_mode, st_enable=st_enable)[0] * cylinder.size[0])
   else:
     vec1 = math.normalize(jp.cross(vec, axis)) * cylinder.size[0]
   vec1 *= jp.sqrt(3.0) * 0.5
@@ -217,8 +252,15 @@ def plane_cylinder(
   # cylinder parallel to plane
   d3 = dist0 - prjaxis + prjvec
   if soft:
-    abs_prjaxis = sj.abs(prjaxis, softness=1e-3, mode=softjax_mode)
-    cond = sj.less(abs_prjaxis, 1e-3, softness=1e-3, mode=softjax_mode)
+    abs_prjaxis = sj.abs(prjaxis,
+                         softness=1e-3,
+                         mode=softjax_mode,
+                         st_enable=st_enable)
+    cond = sj.less(abs_prjaxis,
+                   1e-3,
+                   softness=1e-3,
+                   mode=softjax_mode,
+                   st_enable=st_enable)
     dist = dist.at[1].set(sj.where(cond, d3, dist[1]))
     pos = pos.at[1].set(sj.where(cond, cylinder.pos + vec - axis - n * d3 * 0.5, pos[1]))
   else:
@@ -227,7 +269,9 @@ def plane_cylinder(
     pos = jp.where(cond, pos.at[1].set(cylinder.pos + vec - axis - n * d3 * 0.5), pos)
 
   if soft:
-    frame = jp.stack([math.make_frame_soft(n, softjax_mode)] * 3, axis=0)
+    frame = jp.stack(
+        [math.make_frame_soft(n, softjax_mode, st_enable=st_enable)] * 3,
+        axis=0)
   else:
     frame = jp.stack([math.make_frame(n)] * 3, axis=0)
   return dist, pos, frame
@@ -240,11 +284,22 @@ def _sphere_sphere(
     radius2: jax.Array,
     soft: bool = False,
     softjax_mode: Optional[str] = None,
+    *,
+    st_enable: bool = False,
 ) -> Tuple[jax.Array, jax.Array, jax.Array]:
   """Returns the penetration, contact point, and normal between two spheres."""
   if soft:
-    n, dist = math.normalize_with_norm_soft(pos2 - pos1, mode=softjax_mode)
-    cond = sj.less(dist, 1e-12, softness=1e-12, mode=softjax_mode)
+    n, dist = math.normalize_with_norm_soft(pos2 - pos1,
+                                            mode=softjax_mode,
+                                            st_enable=st_enable)
+    # C2's coincidence step is already saturated beyond this bound. Avoid
+    # evaluating its unused polynomial at dist / 1e-12 for ordinary contacts.
+    comparison_dist = jp.minimum(dist, 1e-10) if softjax_mode == 'c2' else dist
+    cond = sj.less(comparison_dist,
+                   1e-12,
+                   softness=1e-12,
+                   mode=softjax_mode,
+                   st_enable=st_enable)
     n = sj.where(cond, jp.array([1.0, 0.0, 0.0]), n)
   else:
     n, dist = math.normalize_with_norm(pos2 - pos1)
@@ -260,13 +315,21 @@ def sphere_sphere(
     s2: GeomInfo,
     soft: bool,
     softjax_mode: Optional[str],
+    *,
+    st_enable: bool = False,
 ) -> Collision:
   """Calculates contact between two spheres."""
   dist, pos, n = _sphere_sphere(
-      s1.pos, s1.size[0], s2.pos, s2.size[0], soft=soft, softjax_mode=softjax_mode
+      s1.pos,
+      s1.size[0],
+      s2.pos,
+      s2.size[0],
+      soft=soft,
+      softjax_mode=softjax_mode,
+      st_enable=st_enable,
   )
   if soft:
-    return dist, pos, math.make_frame_soft(n, softjax_mode)
+    return dist, pos, math.make_frame_soft(n, softjax_mode, st_enable=st_enable)
   return dist, pos, math.make_frame(n)
 
 
@@ -276,23 +339,35 @@ def sphere_capsule(
     cap: GeomInfo,
     soft: bool,
     softjax_mode: Optional[str],
+    *,
+    st_enable: bool = False,
 ) -> Collision:
   """Calculates one contact between a sphere and a capsule."""
   axis, length = cap.mat[:, 2], cap.size[1]
   segment = axis * length
   if soft:
     pt = math.closest_segment_point_soft(
-        cap.pos - segment, cap.pos + segment, sphere.pos, mode=softjax_mode
+        cap.pos - segment,
+        cap.pos + segment,
+        sphere.pos,
+        mode=softjax_mode,
+        st_enable=st_enable,
     )
   else:
     pt = math.closest_segment_point(
         cap.pos - segment, cap.pos + segment, sphere.pos
     )
   dist, pos, n = _sphere_sphere(
-      sphere.pos, sphere.size[0], pt, cap.size[0], soft=soft, softjax_mode=softjax_mode
+      sphere.pos,
+      sphere.size[0],
+      pt,
+      cap.size[0],
+      soft=soft,
+      softjax_mode=softjax_mode,
+      st_enable=st_enable,
   )
   if soft:
-    return dist, pos, math.make_frame_soft(n, softjax_mode)
+    return dist, pos, math.make_frame_soft(n, softjax_mode, st_enable=st_enable)
   return dist, pos, math.make_frame(n)
 
 
@@ -302,6 +377,8 @@ def capsule_capsule(
     cap2: GeomInfo,
     soft: bool,
     softjax_mode: Optional[str],
+    *,
+    st_enable: bool = False,
 ) -> Collision:
   """Calculates one contact between two capsules."""
   axis1, length1 = cap1.mat[:, 2], cap1.size[1]
@@ -314,6 +391,8 @@ def capsule_capsule(
         cap2.pos - seg2,
         cap2.pos + seg2,
         mode=softjax_mode,
+        st_enable=st_enable,
+        softness=4e-8,
     )
   else:
     pt1, pt2 = math.closest_segment_to_segment_points(
@@ -324,8 +403,14 @@ def capsule_capsule(
     )
   radius1, radius2 = cap1.size[0], cap2.size[0]
   dist, pos, n = _sphere_sphere(
-      pt1, radius1, pt2, radius2, soft=soft, softjax_mode=softjax_mode
+      pt1,
+      radius1,
+      pt2,
+      radius2,
+      soft=soft,
+      softjax_mode=softjax_mode,
+      st_enable=st_enable,
   )
   if soft:
-    return dist, pos, math.make_frame_soft(n, softjax_mode)
+    return dist, pos, math.make_frame_soft(n, softjax_mode, st_enable=st_enable)
   return dist, pos, math.make_frame(n)

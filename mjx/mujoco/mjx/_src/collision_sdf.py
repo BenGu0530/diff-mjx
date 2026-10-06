@@ -99,7 +99,12 @@ def _cylinder(pos: jax.Array, size: jax.Array) -> jax.Array:
 
 
 def _cylinder_grad(x: jax.Array, size: jax.Array) -> jax.Array:
-  """Gradient of the cylinder SDF wrt query point and singularities removed."""
+  """Nominal SDF gradient with regularized derivatives at singularities.
+
+  SDF contact optimization differentiates this gradient. Keep its forward
+  values, but bound division derivatives below a geometry-scaled roundoff
+  length. This numerical safeguard applies independently of contact ST mode.
+  """
   c = sj.sqrt(x[0] * x[0] + x[1] * x[1])
   e = jp.abs(x[2])
   a = jp.array([c - size[0], e - size[1]])
@@ -112,8 +117,17 @@ def _cylinder_grad(x: jax.Array, size: jax.Array) -> jax.Array:
       x[1] / (c + jp.allclose(c, 0) * 1e-12),
       x[2] / (e + jp.allclose(e, 0) * 1e-12),
   ])
+  eps = jp.sqrt(jp.finfo(x.dtype).eps) * jp.maximum(
+      jp.max(jp.abs(size[:2])), 1e-12
+  )
+  grada = math.straight_through(
+      grada, sj.div(x, jp.maximum(jp.array([c, c, e]), eps))
+  )
   gradm = jp.array([[grada[0], grada[1], 0], [0, 0, grada[2]]])
   gradb = grada * b[jp.array([0, 0, 1])] / bnorm
+  gradb = math.straight_through(
+      gradb, sj.div(grada * b[jp.array([0, 0, 1])], jp.maximum(bnorm, eps))
+  )
   return jp.where(a[j] < 0, gradm[j], gradb)
 
 

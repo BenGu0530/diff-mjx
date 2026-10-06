@@ -463,16 +463,7 @@ def forward(m: Model, d: Data) -> Data:
     d_soft = _forward(m, d, soft=True)
     d_hard = _forward(m, d, soft=False)
 
-    def straight_through(x_hard, x_soft):
-      if hasattr(x_hard, 'dtype') and np.issubdtype(x_hard.dtype, np.bool_):
-        return x_hard
-      return (
-          jax.lax.stop_gradient(x_hard)
-          + x_soft
-          - jax.lax.stop_gradient(x_soft)
-      )
-
-    d = jax.tree.map(straight_through, d_hard, d_soft)
+    d = math.straight_through(d_hard, d_soft)
   else:
     d = _forward(m, d, soft=pw_enabled)
   return d
