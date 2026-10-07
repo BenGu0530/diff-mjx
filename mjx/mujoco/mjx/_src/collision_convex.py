@@ -1649,6 +1649,53 @@ def _convex_convex(c1: ConvexInfo, c2: ConvexInfo) -> Collision:
   return dist, pos, n
 
 
+def _box_box_straight_through(
+    b1: ConvexInfo, b2: ConvexInfo, mode: str
+) -> Collision:
+  """Hard box-box contacts in the forward pass, soft box-box gradients.
+
+  The soft manifold may order (or place) its four points differently from the
+  hard one, so each hard contact is paired with the nearest valid soft contact
+  (pairing is not differentiated) and every output (dist, pos, normal, frame)
+  takes the hard value with the paired soft point's gradient. Invalid hard
+  points keep their hard value and get no gradient.
+  """
+  dist_h, pos_h, n_h = _box_box(b1, b2)
+  dist_s, pos_s, n_s = _box_box_soft(b1, b2, mode, st_enable=True)
+  big = jp.finfo(dist_h.dtype).max
+  valid_h = dist_h < big
+  valid_s = dist_s < big
+  sq = jp.sum(
+      jp.square(
+          jax.lax.stop_gradient(pos_h)[:, None, :]
+          - jax.lax.stop_gradient(pos_s)[None, :, :]
+      ),
+      axis=-1,
+  )
+  sq = jp.where(valid_s[None, :], sq, jp.inf)
+  match = jp.argmin(sq, axis=1)
+  has_match = valid_h & jp.isfinite(jp.min(sq, axis=1))
+  dist_m, pos_m, n_m = dist_s[match], pos_s[match], n_s[match]
+
+  def st(hard, soft):
+    keep = has_match.reshape(has_match.shape + (1,) * (hard.ndim - 1))
+    soft = jp.where(keep, soft, jax.lax.stop_gradient(soft))
+    return jp.where(
+        keep, math.straight_through(hard, soft), jax.lax.stop_gradient(hard)
+    )
+
+  dist = st(dist_h, dist_m)
+  pos = st(pos_h, pos_m)
+  n = st(n_h, n_m)
+  frame_h = jax.vmap(math.make_frame)(n_h)
+  frame_s = jax.vmap(
+      functools.partial(math.make_frame_soft, st_enable=True),
+      in_axes=[0, None],
+  )(n_m, mode)
+  frame = st(frame_h, frame_s)
+  return dist, pos, frame
+
+
 @collider(ncon=4)
 def box_box(
     b1: ConvexInfo,
@@ -1659,6 +1706,8 @@ def box_box(
     st_enable: bool = False,
 ) -> Collision:
   """Calculates contacts between two boxes."""
+  if soft and softjax_mode in ('smooth', 'c2') and st_enable:
+    return _box_box_straight_through(b1, b2, softjax_mode)
   if soft and softjax_mode in ('smooth', 'c2'):
     dist, pos, n = _box_box_soft(b1, b2, softjax_mode, st_enable=st_enable)
     frame = jax.vmap(
